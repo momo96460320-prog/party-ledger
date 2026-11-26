@@ -1,0 +1,580 @@
+<title>Ring Breaker</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&display=swap">
+<style>
+  /* Layout: one vertical 9:16 "phone video" frame centered on a deep stage. Single dark look by choice. */
+  :root {
+    --stage: #07060f;
+    --frame: #0d0b1f;
+    --ink: #f4f0ff;
+    --muted: #9a93c7;
+    --hot: #ff5fa2;
+    --display: "Dela Gothic One", "Arial Black", system-ui, sans-serif;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; }
+  body {
+    background: var(--stage); color: var(--ink); font-family: var(--display);
+    display: flex; align-items: center; justify-content: center;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 12px; box-sizing: border-box; overflow: hidden;
+  }
+  #wrap { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+  #frame { position: relative; border-radius: 22px; overflow: hidden; box-shadow: 0 0 0 1px #221d48, 0 30px 80px #000a; background: var(--frame); }
+  canvas { display: block; width: 100%; height: 100%; }
+  #start {
+    position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
+    align-items: center; justify-content: flex-end; padding-bottom: 12%;
+    background: linear-gradient(transparent 55%, #07060fcc);
+    border: 0; color: var(--ink); font: inherit; cursor: pointer;
+  }
+  #start span.btn { background: var(--hot); color: #1a0716; padding: 14px 26px; border-radius: 999px; font-size: 18px; letter-spacing: .04em; box-shadow: 0 0 30px #ff5fa288; }
+  #start span.sub { color: var(--muted); font-family: system-ui, sans-serif; font-size: 13px; }
+  #start:focus-visible span.btn { outline: 3px solid var(--ink); outline-offset: 3px; }
+  #mute { position: absolute; right: 12px; bottom: 12px; background: #ffffff14; color: var(--ink); border: 1px solid #ffffff2a; border-radius: 999px; padding: 6px 12px; font: 12px system-ui, sans-serif; cursor: pointer; }
+  #mute:focus-visible { outline: 2px solid var(--ink); }
+  #rare { position: absolute; right: 12px; top: 12px; background: #ffd34d22; color: #ffd34d; border: 1px solid #ffd34d66; border-radius: 999px; padding: 6px 12px; font: 12px system-ui, sans-serif; cursor: pointer; }
+  #rare[aria-pressed="true"] { background: #ffd34d; color: #1a0716; }
+  #rare:focus-visible { outline: 2px solid var(--ink); }
+  [hidden] { display: none !important; }
+</style>
+
+<div id="wrap">
+  <div id="frame">
+    <canvas id="c" aria-label="A ball breaking through ten spinning rings"></canvas>
+    <button id="start" type="button" aria-label="Play with sound">
+      <span class="btn">▶ Tap to play (sound on)</span>
+      <span class="sub">音ありで再生・自動でループします</span>
+    </button>
+    <button id="mute" type="button" hidden>🔊 Sound on</button>
+    <button id="rare" type="button" hidden title="次にリングを割った瞬間にプレミアム演出を出します">★ 次でプレミアム</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const W = 540, H = 960;
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const frame = document.getElementById('frame');
+  const wrap = document.getElementById('wrap');
+  function fit() {
+    const aw = wrap.clientWidth, ah = wrap.clientHeight;
+    let h = ah, w = h * 9 / 16;
+    if (w > aw) { w = aw; h = w * 16 / 9; }
+    frame.style.width = w + 'px'; frame.style.height = h + 'px';
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  addEventListener('resize', fit); fit();
+  const base = () => ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+
+  // ================= AUDIO =================
+  let ac = null, bus = null, lp = null, muted = false;
+  const st = s => 2 ** (s / 12);
+  const C4 = 261.63;
+  function initAudio() {
+    if (ac) return;
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    const comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -14; comp.ratio.value = 4;
+    lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 18000; lp.Q.value = 0.7;
+    bus = ac.createGain(); bus.gain.value = 0.75;
+    // generated hall reverb
+    const len = ac.sampleRate * 2.4, ir = ac.createBuffer(2, len, ac.sampleRate);
+    for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len) ** 3.2; }
+    const verb = ac.createConvolver(); verb.buffer = ir;
+    const wet = ac.createGain(); wet.gain.value = 0.32;
+    bus.connect(lp); lp.connect(comp); lp.connect(verb); verb.connect(wet); wet.connect(comp);
+    comp.connect(ac.destination);
+  }
+  function setMuffle(on) {
+    if (!ac) return;
+    lp.frequency.cancelScheduledValues(ac.currentTime);
+    lp.frequency.setTargetAtTime(on ? 1400 : 18000, ac.currentTime, on ? 0.05 : 0.12);
+  }
+  // soft electric-piano / bell tone (2-op FM)
+  function bell(freq, vol = 0.22, dur = 0.9, t0 = 0, pan = 0) {
+    if (!ac || muted) return;
+    const t = ac.currentTime + t0;
+    const out = ac.createGain();
+    out.gain.setValueAtTime(0.0001, t);
+    out.gain.exponentialRampToValueAtTime(vol, t + 0.004);
+    out.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    const p = ac.createStereoPanner ? ac.createStereoPanner() : null;
+    if (p) { p.pan.value = pan; out.connect(p); p.connect(bus); } else out.connect(bus);
+    const car = ac.createOscillator(); car.type = 'sine'; car.frequency.value = freq;
+    const mod = ac.createOscillator(); mod.type = 'sine'; mod.frequency.value = freq * 2;
+    const idx = ac.createGain();
+    idx.gain.setValueAtTime(freq * 1.6, t); idx.gain.exponentialRampToValueAtTime(freq * 0.05, t + 0.25);
+    mod.connect(idx); idx.connect(car.frequency);
+    car.connect(out);
+    const sub = ac.createOscillator(); sub.type = 'triangle'; sub.frequency.value = freq / 2;
+    const sg = ac.createGain(); sg.gain.value = 0.25; sub.connect(sg); sg.connect(out);
+    [car, mod, sub].forEach(o => { o.start(t); o.stop(t + dur + 0.05); });
+  }
+  function bass(freq, vol = 0.5, dur = 1.2) {
+    if (!ac || muted) return;
+    const t = ac.currentTime;
+    const o = ac.createOscillator(); o.type = 'sine'; o.frequency.value = freq;
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(bus); o.start(t); o.stop(t + dur + 0.05);
+    const k = ac.createOscillator(); k.type = 'sine';
+    k.frequency.setValueAtTime(160, t); k.frequency.exponentialRampToValueAtTime(42, t + 0.25);
+    const kg = ac.createGain(); kg.gain.setValueAtTime(0.7 * vol, t); kg.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+    k.connect(kg); kg.connect(bus); k.start(t); k.stop(t + 0.4);
+  }
+  function shatterSfx(size = 1) {
+    if (!ac || muted) return;
+    const t = ac.currentTime, len = ac.sampleRate * 0.8;
+    const buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len) ** 4 * (Math.random() < 0.08 ? 2.2 : 1);
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const f = ac.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 3000;
+    const g = ac.createGain(); g.gain.value = 0.22 * size;
+    src.connect(f); f.connect(g); g.connect(bus); src.start(t);
+  }
+  function riser() {
+    if (!ac || muted) return;
+    const t = ac.currentTime, len = ac.sampleRate * 0.5;
+    const buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.sin(Math.PI * i / len);
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 3;
+    f.frequency.setValueAtTime(300, t); f.frequency.exponentialRampToValueAtTime(3000, t + 0.5);
+    const g = ac.createGain(); g.gain.value = 0.18;
+    src.connect(f); f.connect(g); g.connect(ac.destination); // bypass muffle so it cuts through
+    src.start(t);
+  }
+
+  // --- impact & jackpot sounds (original designs) ---
+  let shaper = null;
+  function getShaper() {
+    if (shaper) return shaper;
+    shaper = ac.createWaveShaper();
+    const c = new Float32Array(1024);
+    for (let i = 0; i < 1024; i++) { const x = i / 512 - 1; c[i] = Math.tanh(x * 3); }
+    shaper.curve = c; shaper.connect(bus); return shaper;
+  }
+  // deep sub drop: "dooon" felt more than heard; harmonics added so phone speakers carry it
+  function subDrop(size = 1) {
+    if (!ac || muted) return;
+    const t = ac.currentTime;
+    const o = ac.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(72, t); o.frequency.exponentialRampToValueAtTime(30, t + 1.1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.9 * size, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + 1.3);
+    o.connect(g); g.connect(getShaper()); o.start(t); o.stop(t + 1.4);
+  }
+  // "kyuin": quick rising whine with vibrato
+  function kyuin() {
+    if (!ac || muted) return;
+    const t = ac.currentTime;
+    const o = ac.createOscillator(); o.type = 'sawtooth';
+    o.frequency.setValueAtTime(500, t); o.frequency.exponentialRampToValueAtTime(2600, t + 0.28);
+    const lfo = ac.createOscillator(); lfo.frequency.value = 28; const lg = ac.createGain(); lg.gain.value = 60; lfo.connect(lg); lg.connect(o.frequency);
+    const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 5000;
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.12, t + 0.03); g.gain.setValueAtTime(0.12, t + 0.3); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.7);
+    o.connect(f); f.connect(g); g.connect(bus); o.start(t); lfo.start(t); o.stop(t + 0.75); lfo.stop(t + 0.75);
+  }
+  // "peka!": the lamp lights up – a bright, clean two-tone ping
+  function peka() {
+    if (!ac || muted) return;
+    const t = ac.currentTime;
+    [[1568, 0.22], [2093, 0.16], [3136, 0.06]].forEach(([f, v]) => {
+      const o = ac.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+      const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 0.003); g.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+      o.connect(g); g.connect(bus); o.start(t); o.stop(t + 1.7);
+    });
+  }
+  // "po-kyuuun": short pop then a long singing rise with vibrato
+  function pokyun() {
+    if (!ac || muted) return;
+    const t = ac.currentTime;
+    const p = ac.createOscillator(); p.type = 'square'; p.frequency.setValueAtTime(520, t); p.frequency.exponentialRampToValueAtTime(260, t + 0.07);
+    const pg = ac.createGain(); pg.gain.setValueAtTime(0.14, t); pg.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+    p.connect(pg); pg.connect(bus); p.start(t); p.stop(t + 0.1);
+    const s = t + 0.1;
+    [[1, 'sine', 0.22], [2, 'triangle', 0.07]].forEach(([m, type, v]) => {
+      const o = ac.createOscillator(); o.type = type;
+      o.frequency.setValueAtTime(700 * m, s); o.frequency.exponentialRampToValueAtTime(2350 * m, s + 0.45);
+      const lfo = ac.createOscillator(); lfo.frequency.setValueAtTime(3, s); lfo.frequency.linearRampToValueAtTime(7, s + 1.5);
+      const lg = ac.createGain(); lg.gain.setValueAtTime(0, s); lg.gain.linearRampToValueAtTime(70 * m, s + 0.6); lfo.connect(lg); lg.connect(o.frequency);
+      const g = ac.createGain(); g.gain.setValueAtTime(0.0001, s); g.gain.exponentialRampToValueAtTime(v, s + 0.04); g.gain.setValueAtTime(v, s + 0.9); g.gain.exponentialRampToValueAtTime(0.0001, s + 2.2);
+      o.connect(g); g.connect(bus); o.start(s); lfo.start(s); o.stop(s + 2.3); lfo.stop(s + 2.3);
+    });
+  }
+  function vibrate(p) { try { navigator.vibrate && navigator.vibrate(p); } catch (e) {} }
+
+  // chord progression, one chord per ring: C G Am F C G Am F Dm G -> final C
+  const PROG = [[0,'M'],[-5,'M'],[-3,'m'],[-7,'M'],[0,'M'],[-5,'M'],[-3,'m'],[-7,'M'],[2,'m'],[-5,'M']];
+  const ARP = { M: [0, 4, 7, 12, 16, 19, 24, 19, 16, 12], m: [0, 3, 7, 12, 15, 19, 24, 19, 15, 12] };
+
+  // ================= WORLD =================
+  const C = { x: W / 2, y: H * 0.52 };
+  const N = 10, R0 = 46, DR = 21, BR = 8, G = 620;
+  let rings, ball, cur, bounces, ringBounces, state, stateT, parts, waves, trail, flash, shake, zoom, total;
+  let timeScale = 1, slowmo = 0, hitStop = 0, slowCooldown = 0, punch = 0;
+  let streak = 0, lampT = 0, blackout = 0, rainbowT = 0, popups = [], forcePremium = false;
+
+  function reset() {
+    rings = [];
+    for (let i = 0; i < N; i++) rings.push({
+      r: R0 + i * DR, ang: Math.random() * Math.PI * 2,
+      w: (i % 2 ? -1 : 1) * (1.0 + i * 0.12), gap: 0.46,
+      hue: (300 + i * 26) % 360, alive: true, hit: 0, hitA: 0,
+    });
+    ball = { x: C.x, y: C.y - 10, vx: (Math.random() * 2 - 1) * 200, vy: -80, passing: false, squash: 0, sqA: 0 };
+    cur = 0; bounces = 0; ringBounces = 0; state = 'play'; stateT = 0; total = 0;
+    parts = []; waves = []; trail = []; flash = 0; shake = 0; slowmo = 0; hitStop = 0; punch = 0;
+    zoom = targetZoom(); setMuffle(false);
+    streak = 0; popups = []; rainbowT = 0; lampT = 0; blackout = 0;
+  }
+  function targetZoom() {
+    if (state === 'done') return 1;
+    const r = rings[Math.min(cur, N - 1)].r;
+    return Math.min(3.2, Math.max(1, 175 / r)) * (1 + punch * 0.1);
+  }
+  const wrapA = a => Math.atan2(Math.sin(a), Math.cos(a));
+
+  // look ahead: will the ball reach the gap (or just miss it) soon?
+  function predict() {
+    const ring = rings[cur];
+    let x = ball.x, y = ball.y, vx = ball.vx, vy = ball.vy;
+    const h = 1 / 120;
+    for (let t = 0; t < 0.28; t += h) {
+      vy += G * h; x += vx * h; y += vy * h;
+      const dx = x - C.x, dy = y - C.y, d = Math.hypot(dx, dy);
+      if (d + BR >= ring.r) {
+        const rel = Math.abs(wrapA(Math.atan2(dy, dx) - (ring.ang + ring.w * t)));
+        const half = ring.gap / 2 - Math.asin(BR / ring.r);
+        if (rel < half) return 'in';
+        if (rel < half + 0.22) return 'near';
+        return 'wall';
+      }
+    }
+    return 'none';
+  }
+
+  function step(dt) {
+    stateT += dt;
+    for (const r of rings) { r.ang += r.w * dt; r.hit = Math.max(0, r.hit - dt * 2.5); }
+    flash = Math.max(0, flash - dt * 3);
+    shake = Math.max(0, shake - dt * 3);
+    punch = Math.max(0, punch - dt * 2);
+    ball.squash = Math.max(0, ball.squash - dt * 8);
+    zoom += (targetZoom() - zoom) * Math.min(1, dt * 2.4);
+    if (state === 'done' && stateT > 4.2) reset();
+
+    ball.vy += G * dt; ball.x += ball.vx * dt; ball.y += ball.vy * dt;
+
+    if (state === 'play') {
+      const ring = rings[cur];
+      const dx = ball.x - C.x, dy = ball.y - C.y, dist = Math.hypot(dx, dy) || 0.001;
+      const nx = dx / dist, ny = dy / dist;
+      if (!ball.passing && dist + BR >= ring.r) {
+        const ang = Math.atan2(dy, dx);
+        const rel = wrapA(ang - ring.ang);
+        const half = ring.gap / 2 - Math.asin(Math.min(1, BR / ring.r));
+        if (Math.abs(rel) < half && ball.vx * dx + ball.vy * dy > 0) {
+          ball.passing = true;
+        } else {
+          const dot = ball.vx * nx + ball.vy * ny;
+          if (dot > 0) {
+            ball.vx -= 2 * dot * nx; ball.vy -= 2 * dot * ny;
+            const kick = (Math.random() * 2 - 1) * 60;
+            ball.vx += -ny * kick; ball.vy += nx * kick;
+            const sp = Math.hypot(ball.vx, ball.vy);
+            const target = Math.min(900, Math.max(sp * 1.01, 300 + cur * 35));
+            ball.vx *= target / sp; ball.vy *= target / sp;
+            bounces++; ringBounces++;
+            if (ringBounces > 30) ring.gap = Math.min(1.2, ring.gap + 0.02); // slow, small mercy
+            const [root, q] = PROG[cur];
+            const arp = ARP[q][(ringBounces - 1) % ARP[q].length];
+            bell(C4 * st(root + arp), 0.2, 0.9, 0, Math.max(-0.8, Math.min(0.8, nx)));
+            ring.hit = 1; ring.hitA = wrapA(ang - ring.ang);
+            if (Math.abs(rel) < half + 0.16) nearMiss(ring, rel);
+            ball.squash = 1; ball.sqA = ang;
+            for (let i = 0; i < 8; i++) {
+              const a = ang + Math.PI + (Math.random() - 0.5) * 1.8, s = 60 + Math.random() * 200;
+              parts.push({ x: C.x + nx * ring.r, y: C.y + ny * ring.r, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.5, max: 0.5, hue: ring.hue, sz: 1.5 + Math.random() * 2 });
+            }
+          }
+          const over = dist + BR - ring.r;
+          ball.x -= nx * over; ball.y -= ny * over;
+        }
+      }
+      if (ball.passing && dist - BR > ring.r + 1) {
+        const noTouch = ringBounces === 0;
+        ring.alive = false; ball.passing = false; ringBounces = 0;
+        breakRing(ring, nx, ny, noTouch);
+      }
+    }
+
+    trail.push({ x: ball.x, y: ball.y });
+    if (trail.length > 34) trail.shift();
+    for (const p of parts) { p.vy += 380 * dt; p.vx *= 0.99; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; if (p.rot != null) p.rot += p.vr * dt; }
+    parts = parts.filter(p => p.life > 0);
+    for (const w of waves) w.t += dt;
+    waves = waves.filter(w => w.t < w.max);
+  }
+
+  // the ball clipped the edge of the gap: so close
+  function nearMiss(ring, rel) {
+    const edge = ring.ang + Math.sign(rel || 1) * ring.gap / 2;
+    const ex = C.x + Math.cos(edge) * ring.r, ey = C.y + Math.sin(edge) * ring.r;
+    for (let i = 0; i < 18; i++) { const a = Math.random() * Math.PI * 2, s = 120 + Math.random() * 380; parts.push({ x: ex, y: ey, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.45, max: 0.45, hue: 50, sz: 1.5 + Math.random() * 2 }); }
+    shake = Math.max(shake, 0.3);
+    if (ac && !muted) { const t = ac.currentTime; [[2637, 0.12], [3951, 0.07], [5274, 0.04]].forEach(([f, v]) => { const o = ac.createOscillator(); o.frequency.value = f; const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5); o.connect(g); g.connect(bus); o.start(t); o.stop(t + 0.55); }); }
+  }
+  function goldBurst(x, y, n, rainbow) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, s = 120 + Math.random() * 700;
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 200, life: 1.8, max: 1.8, hue: rainbow ? Math.random() * 360 : 40 + Math.random() * 15, sz: 2 + Math.random() * 4 });
+    }
+  }
+  function triggerPremium() {
+    forcePremium = false; streak = 0;
+    hitStop = 0.8; blackout = 0.8; setMuffle(true);
+    setTimeout(() => {
+      setMuffle(false); lampT = 5; peka(); vibrate([60, 50, 120]);
+      setTimeout(() => {
+        pokyun(); subDrop(1.2); rainbowT = 4; flash = 1; shake = 1.3; punch = 1;
+        popups.push({ text: 'PREMIUM!!', t: 0, rainbow: true, size: 58 });
+        goldBurst(C.x, C.y, 160, true);
+      }, 320);
+    }, 800);
+  }
+  function breakRing(ring, nx, ny, noTouch) {
+    const n = Math.round(ring.r * 1.1);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      if (Math.abs(wrapA(a - ring.ang)) < ring.gap / 2) continue;
+      const s = 80 + Math.random() * 420;
+      parts.push({ x: C.x + Math.cos(a) * ring.r, y: C.y + Math.sin(a) * ring.r,
+        vx: Math.cos(a) * s + (Math.random() - .5) * 120, vy: Math.sin(a) * s + (Math.random() - .5) * 120,
+        life: 1.4, max: 1.4, hue: ring.hue, sz: 2 + Math.random() * 3.5, shard: true, rot: Math.random() * 6, vr: (Math.random() - .5) * 20 });
+    }
+    waves.push({ r: ring.r, t: 0, max: 0.8, hue: ring.hue });
+    hitStop = 0.07; flash = 1; shake = 0.5 + cur * 0.05; punch = 1;
+    slowmo = 0; setMuffle(false);
+    const [root, q] = PROG[cur];
+    const third = q === 'M' ? 4 : 3;
+    bass(C4 * st(root - 24), 0.5);
+    shatterSfx(0.7 + cur * 0.05);
+    [0, third, 7, 12, 12 + third].forEach((s, i) => bell(C4 * st(root + 12 + s), 0.15, 1.6, 0.02 + i * 0.035, (i - 2) * 0.3));
+    subDrop(0.75 + cur * 0.04); vibrate(50);
+    streak = noTouch ? streak + 1 : 0;
+    const premium = forcePremium || streak >= 2 || Math.random() < 1 / 80;
+    if (premium) triggerPremium();
+    else if (noTouch) {
+      kyuin(); popups.push({ text: 'NO TOUCH!', t: 0, gold: true, size: 44 });
+      goldBurst(ball.x, ball.y, 50, false);
+    }
+    cur++;
+    ball.vx += nx * 120; ball.vy += ny * 120;
+    if (cur >= N) finale();
+  }
+
+  function finale() {
+    state = 'done'; stateT = 0; total = bounces;
+    shake = 1.6; hitStop = 0.18;
+    waves.push({ r: 30, t: 0, max: 1.4, hue: 0, big: true });
+    setTimeout(() => {
+      bass(C4 / 4, 0.7, 2.5);
+      [0, 4, 7, 12, 16, 19, 24, 28].forEach((s, i) => bell(C4 * st(s + 12), 0.18, 2.6, i * 0.07, ((i % 3) - 1) * 0.5));
+      shatterSfx(1.4);
+    }, 60);
+    for (let i = 0; i < 200; i++) {
+      const a = Math.random() * Math.PI * 2, s = 150 + Math.random() * 950;
+      parts.push({ x: ball.x, y: ball.y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 2.2, max: 2.2, hue: Math.random() * 360, sz: 2 + Math.random() * 5 });
+    }
+  }
+
+  // ================= RENDER =================
+  function ringPath(r, active) {
+    const a0 = r.gap / 2, a1 = Math.PI * 2 - r.gap / 2;
+    if (!active || r.hit < 0.02) { ctx.beginPath(); ctx.arc(C.x, C.y, r.r, r.ang + a0, r.ang + a1); return; }
+    ctx.beginPath();
+    const steps = 140, age = 1 - r.hit;
+    for (let i = 0; i <= steps; i++) {
+      const la = a0 + (a1 - a0) * i / steps;
+      const d = wrapA(la - r.hitA);
+      const wob = 7 * r.hit * Math.exp(-(d * d) / 0.12) * Math.cos(age * 28);
+      const rr = r.r + wob, a = r.ang + la;
+      const x = C.x + Math.cos(a) * rr, y = C.y + Math.sin(a) * rr;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+  }
+
+  function draw() {
+    base();
+    ctx.fillStyle = '#0d0b1f'; ctx.fillRect(0, 0, W, H);
+    const curHue = rings[Math.min(cur, N - 1)].hue;
+    const bg = ctx.createRadialGradient(C.x, C.y, 20, C.x, C.y, 620);
+    bg.addColorStop(0, `hsla(${curHue},80%,35%,${0.26 + flash * 0.35})`); bg.addColorStop(1, 'rgba(13,11,31,0)');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    const sx = shake > 0 ? (Math.random() - .5) * 16 * shake : 0, sy = shake > 0 ? (Math.random() - .5) * 16 * shake : 0;
+    ctx.translate(C.x + sx, C.y + sy); ctx.scale(zoom, zoom); ctx.translate(-C.x, -C.y);
+
+    // shockwaves
+    for (const w of waves) {
+      const k = w.t / w.max;
+      ctx.strokeStyle = w.big ? `rgba(255,255,255,${(1 - k) * 0.8})` : `hsla(${w.hue},95%,70%,${(1 - k) * 0.7})`;
+      ctx.lineWidth = (w.big ? 14 : 6) * (1 - k) + 1;
+      ctx.beginPath(); ctx.arc(C.x, C.y, w.r + k * (w.big ? 700 : 160), 0, Math.PI * 2); ctx.stroke();
+    }
+
+    ctx.lineCap = 'round';
+    for (let i = N - 1; i >= 0; i--) {
+      const r = rings[i];
+      if (!r.alive) continue;
+      const active = i === cur;
+      const hue = rainbowT > 0 ? (r.hue + performance.now() * 0.4 + i * 36) % 360 : r.hue;
+      ctx.shadowColor = `hsl(${hue},95%,62%)`; ctx.shadowBlur = active ? 22 + r.hit * 28 : 8 + (rainbowT > 0 ? 14 : 0);
+      ctx.strokeStyle = `hsla(${hue},90%,${active ? 66 + r.hit * 24 : 58}%,${active || rainbowT > 0 ? 1 : 0.72})`;
+      ctx.lineWidth = (active ? 6 : 4.5) / Math.sqrt(zoom) + r.hit * 2.5;
+      ringPath(r, active); ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+
+    // ribbon trail
+    if (trail.length > 2) {
+      for (let i = 1; i < trail.length; i++) {
+        const k = i / trail.length;
+        ctx.strokeStyle = `hsla(${curHue},100%,${70 + k * 25}%,${k * 0.55})`;
+        ctx.lineWidth = BR * 2 * k * 0.9;
+        ctx.beginPath(); ctx.moveTo(trail[i - 1].x, trail[i - 1].y); ctx.lineTo(trail[i].x, trail[i].y); ctx.stroke();
+      }
+    }
+    // ball with squash
+    if (!(state === 'done' && stateT > 0.05)) {
+      ctx.save(); ctx.translate(ball.x, ball.y); ctx.rotate(ball.sqA);
+      const s = ball.squash * 0.35; ctx.scale(1 - s, 1 + s * 0.8);
+      ctx.shadowColor = '#fff'; ctx.shadowBlur = 26;
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(0, 0, BR, 0, Math.PI * 2); ctx.fill();
+      ctx.restore(); ctx.shadowBlur = 0;
+    }
+
+    for (const p of parts) {
+      const a = p.life / p.max;
+      ctx.fillStyle = `hsla(${p.hue},95%,${60 + a * 20}%,${a})`;
+      if (p.shard) { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillRect(-p.sz * 1.6, -p.sz * 0.5, p.sz * 3.2, p.sz); ctx.restore(); }
+      else { ctx.beginPath(); ctx.arc(p.x, p.y, p.sz * (a + .3), 0, Math.PI * 2); ctx.fill(); }
+    }
+    ctx.restore();
+
+    // slow-mo vignette
+    if (slowmo > 0.01) {
+      const v = ctx.createRadialGradient(W / 2, H / 2, 200, W / 2, H / 2, 620);
+      v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, `rgba(0,0,0,${0.55 * slowmo})`);
+      ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+    }
+    if (flash > 0.6) { ctx.fillStyle = `rgba(255,255,255,${(flash - 0.6) * 0.5})`; ctx.fillRect(0, 0, W, H); }
+
+    // HUD
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+    ctx.lineWidth = 9; ctx.strokeStyle = '#0d0b1f'; ctx.fillStyle = '#f4f0ff';
+    ctx.font = '31px "Dela Gothic One", "Arial Black", sans-serif';
+    const q = state === 'done' ? 'ALL 10 BROKEN!!' : 'Can it break all 10?';
+    ctx.strokeText(q, W / 2, 78); ctx.fillText(q, W / 2, 78);
+    const pw = 26, gx = 8, sx0 = W / 2 - (N * pw + (N - 1) * gx) / 2;
+    for (let i = 0; i < N; i++) {
+      ctx.fillStyle = i < cur ? `hsl(${rings[i].hue},90%,62%)` : 'rgba(255,255,255,0.14)';
+      ctx.fillRect(sx0 + i * (pw + gx), 112, pw, 7);
+    }
+    if (state === 'done') {
+      const pop = 1 + Math.max(0, 0.4 - stateT) * 1.2;
+      ctx.save(); ctx.translate(W / 2, H - 150); ctx.scale(pop, pop);
+      ctx.font = '40px "Dela Gothic One", "Arial Black", sans-serif'; ctx.fillStyle = '#ff5fa2';
+      const t = `Escaped in ${total} bounces`;
+      const mw = ctx.measureText(t).width; if (mw > 480) ctx.scale(480 / mw, 480 / mw);
+      ctx.strokeText(t, 0, 0); ctx.fillText(t, 0, 0); ctx.restore();
+      ctx.font = '17px "Dela Gothic One", "Arial Black", sans-serif'; ctx.fillStyle = '#9a93c7';
+      ctx.strokeText('Did you guess it? 👇', W / 2, H - 100); ctx.fillText('Did you guess it? 👇', W / 2, H - 100);
+    } else {
+      ctx.font = '21px "Dela Gothic One", "Arial Black", sans-serif'; ctx.fillStyle = '#f4f0ff';
+      const cap = slowmo > 0.5 ? '...' : cur >= N - 2 ? 'Almost there...!' : cur >= 5 ? 'Speeding up...' : `${N - cur} rings left`;
+      ctx.strokeText(cap, W / 2, H - 120); ctx.fillText(cap, W / 2, H - 120);
+    }
+    drawFx();
+  }
+
+  function drawFx() {
+    const now = performance.now();
+    // popups (NO TOUCH / PREMIUM)
+    for (const p of popups) {
+      const k = p.t, a = k < 1.2 ? 1 : Math.max(0, 1 - (k - 1.2) * 2.5);
+      const sc = 1 + Math.max(0, 0.3 - k) * 2.2;
+      ctx.save(); ctx.translate(W / 2, 300); ctx.scale(sc, sc); ctx.globalAlpha = a;
+      ctx.font = `${p.size}px "Dela Gothic One", "Arial Black", sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.lineWidth = 10; ctx.strokeStyle = '#0d0b1f'; ctx.strokeText(p.text, 0, 0);
+      if (p.rainbow) {
+        const g = ctx.createLinearGradient(-200, 0, 200, 0);
+        for (let i = 0; i <= 6; i++) g.addColorStop(i / 6, `hsl(${(now * 0.5 + i * 60) % 360},100%,65%)`);
+        ctx.fillStyle = g; ctx.shadowColor = '#fff'; ctx.shadowBlur = 25;
+      } else { ctx.fillStyle = '#ffd34d'; ctx.shadowColor = '#ffb300'; ctx.shadowBlur = 20; }
+      ctx.fillText(p.text, 0, 0); ctx.restore();
+    }
+    // blackout (sudden silence before the jackpot)
+    if (blackout > 0) { ctx.fillStyle = 'rgba(0,0,0,0.93)'; ctx.fillRect(0, 0, W, H); }
+    // the LUCKY lamp: always there, dark, waiting
+    const lx = 70, ly = H - 62, on = lampT > 0;
+    ctx.save();
+    if (on) {
+      const pulse = 0.75 + 0.25 * Math.sin(now / 90);
+      const hue = (now * 0.3) % 360;
+      ctx.shadowColor = `hsl(${hue},100%,60%)`; ctx.shadowBlur = 50 * pulse;
+      const g = ctx.createRadialGradient(lx, ly, 2, lx, ly, 34);
+      g.addColorStop(0, '#fff'); g.addColorStop(0.45, `hsl(${hue},100%,70%)`); g.addColorStop(1, `hsl(${hue},100%,45%)`);
+      ctx.fillStyle = g;
+    } else ctx.fillStyle = '#211c3e';
+    ctx.beginPath(); ctx.ellipse(lx, ly, 46, 26, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = on ? '#fff' : '#3a3366'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.font = '17px "Dela Gothic One", "Arial Black", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = on ? '#1a0716' : '#4a4378'; ctx.fillText('LUCKY', lx, ly + 1);
+    ctx.restore();
+  }
+
+  // ================= LOOP =================
+  reset();
+  let last = performance.now(), running = false;
+  function loop(now) {
+    const real = Math.min(0.05, (now - last) / 1000); last = now;
+    slowCooldown = Math.max(0, slowCooldown - real);
+
+    // real-time effects (keep running during freezes)
+    blackout = Math.max(0, blackout - real);
+    lampT = Math.max(0, lampT - real);
+    rainbowT = Math.max(0, rainbowT - real);
+    for (const p of popups) p.t += real;
+    popups = popups.filter(p => p.t < 1.7);
+    const targetTS = slowmo > 0.5 ? 0.22 : 1;
+    timeScale += (targetTS - timeScale) * Math.min(1, real * (targetTS < timeScale ? 18 : 6));
+
+    if (hitStop > 0) hitStop -= real;
+    else { const S = 5, dt = real * timeScale; for (let i = 0; i < S; i++) step(dt / S); }
+    if (slowmo > 0 && slowmo < 1) slowmo = Math.max(0, slowmo - real * 3);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  draw();
+  const startBtn = document.getElementById('start'), muteBtn = document.getElementById('mute');
+  startBtn.addEventListener('click', () => {
+    initAudio(); if (ac.state === 'suspended') ac.resume();
+    startBtn.hidden = true; muteBtn.hidden = false; rareBtn.hidden = false;
+    if (!running) { running = true; reset(); last = performance.now(); requestAnimationFrame(loop); }
+  });
+  const rareBtn = document.getElementById('rare');
+  rareBtn.addEventListener('click', () => { forcePremium = true; rareBtn.setAttribute('aria-pressed', 'true'); rareBtn.textContent = '★ 待機中…'; });
+  setInterval(() => { if (!forcePremium && rareBtn.getAttribute('aria-pressed') === 'true') { rareBtn.setAttribute('aria-pressed', 'false'); rareBtn.textContent = '★ 次でプレミアム'; } }, 200);
+  muteBtn.addEventListener('click', () => { muted = !muted; muteBtn.textContent = muted ? '🔇 Sound off' : '🔊 Sound on'; });
+  addEventListener('resize', () => { if (!running) draw(); });
+  document.fonts && document.fonts.ready.then(() => { if (!running) draw(); });
+})();
+</script>
